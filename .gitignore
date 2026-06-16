@@ -8,3 +8,4 @@ venv/
 metrics.json
 fixtures/*.json
 !fixtures/test_local_rule.json
+attack_index_cache.json

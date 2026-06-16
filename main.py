@@ -420,6 +420,311 @@ Return ONLY valid compact JSON, no markdown, no explanation."""
         return json.dumps({"error": str(e), "raw_rule": rule_text})
 
 
+# ── MITRE ATT&CK MAPPING ─────────────────────────────────────────
+ATTACK_STIX_URL = os.getenv(
+    "ATTACK_STIX_URL",
+    "https://raw.githubusercontent.com/mitre/cti/master/enterprise-attack/enterprise-attack.json",
+)
+ATTACK_CACHE_TTL_HOURS = float(os.getenv("ATTACK_CACHE_TTL_HOURS", "24"))
+_ATTACK_CACHE_PATH = os.getenv(
+    "ATTACK_CACHE_PATH",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "attack_index_cache.json"),
+)
+_TECHNIQUE_ID_RE = re.compile(r"^T\d{4}(?:\.\d{3})?$")
+_attack_index_mem: dict | None = None
+_attack_index_meta: dict = {}
+_attack_index_ts: float = 0.0
+_ATTACK_LOCK = threading.Lock()
+
+
+def _build_attack_index(stix: dict) -> dict:
+    """Turn an enterprise-attack STIX bundle into {technique_id: {name, tactics, ...}}."""
+    techniques: dict = {}
+    parents: dict = {}
+    for obj in stix.get("objects", []):
+        if obj.get("type") != "attack-pattern":
+            continue
+        if obj.get("revoked") or obj.get("x_mitre_deprecated"):
+            continue
+        ext_id, url = "", ""
+        for ref in obj.get("external_references", []):
+            if ref.get("source_name") == "mitre-attack" and ref.get("external_id"):
+                ext_id = ref["external_id"]
+                url = ref.get("url", "")
+                break
+        if not _TECHNIQUE_ID_RE.match(ext_id):
+            continue
+        tactics = [
+            ph.get("phase_name")
+            for ph in obj.get("kill_chain_phases", [])
+            if ph.get("kill_chain_name") == "mitre-attack" and ph.get("phase_name")
+        ]
+        entry = {
+            "id": ext_id,
+            "name": obj.get("name", ""),
+            "tactics": tactics,
+            "is_subtechnique": bool(obj.get("x_mitre_is_subtechnique")),
+            "url": url,
+        }
+        techniques[ext_id] = entry
+        if "." not in ext_id:
+            parents[ext_id] = entry["name"]
+    # compose "Parent: Sub" display names for sub-techniques
+    for tid, entry in techniques.items():
+        if entry["is_subtechnique"] and "." in tid:
+            pname = parents.get(tid.split(".")[0])
+            entry["full_name"] = f"{pname}: {entry['name']}" if pname else entry["name"]
+        else:
+            entry["full_name"] = entry["name"]
+    return techniques
+
+
+def _load_attack_index(force: bool = False) -> dict | None:
+    """Return the ATT&CK technique index, fetching the live STIX bundle and caching to
+    memory + disk (TTL controlled by ATTACK_CACHE_TTL_HOURS). Returns None only when the
+    catalog is unavailable (no network AND no cache) so callers can flag results."""
+    global _attack_index_mem, _attack_index_ts, _attack_index_meta
+    ttl = ATTACK_CACHE_TTL_HOURS * 3600
+    now = time.time()
+    with _ATTACK_LOCK:
+        if not force and _attack_index_mem is not None and (now - _attack_index_ts) < ttl:
+            return _attack_index_mem
+        # fresh disk cache
+        if not force and os.path.exists(_ATTACK_CACHE_PATH):
+            try:
+                if (now - os.path.getmtime(_ATTACK_CACHE_PATH)) < ttl:
+                    with open(_ATTACK_CACHE_PATH, encoding="utf-8") as f:
+                        cached = json.load(f)
+                    _attack_index_mem = cached.get("techniques", {})
+                    _attack_index_meta = cached.get("meta", {})
+                    _attack_index_ts = now
+                    return _attack_index_mem
+            except Exception as exc:
+                logger.warning(f"attack cache read failed: {exc}")
+        # fetch live STIX
+        try:
+            resp = requests.get(ATTACK_STIX_URL, timeout=60)
+            resp.raise_for_status()
+            stix = resp.json()
+            techniques = _build_attack_index(stix)
+            if not techniques:
+                raise ValueError("no techniques parsed from STIX bundle")
+            version = ""
+            for obj in stix.get("objects", []):
+                if obj.get("type") == "x-mitre-collection":
+                    version = obj.get("x_mitre_version", "")
+                    break
+            _attack_index_mem = techniques
+            _attack_index_meta = {
+                "source_url": ATTACK_STIX_URL,
+                "version": version,
+                "technique_count": len(techniques),
+            }
+            _attack_index_ts = now
+            try:
+                with open(_ATTACK_CACHE_PATH, "w", encoding="utf-8") as f:
+                    json.dump({"techniques": techniques, "meta": _attack_index_meta}, f)
+            except Exception as exc:
+                logger.warning(f"attack cache write failed: {exc}")
+            return _attack_index_mem
+        except Exception as exc:
+            logger.warning(f"ATT&CK STIX fetch failed: {exc}")
+            # last resort: stale disk cache
+            if os.path.exists(_ATTACK_CACHE_PATH):
+                try:
+                    with open(_ATTACK_CACHE_PATH, encoding="utf-8") as f:
+                        cached = json.load(f)
+                    _attack_index_mem = cached.get("techniques", {})
+                    _attack_index_meta = cached.get("meta", {})
+                    _attack_index_ts = now
+                    logger.warning("using stale ATT&CK cache after fetch failure")
+                    return _attack_index_mem
+                except Exception:
+                    pass
+            return _attack_index_mem  # may still be None
+
+
+def _find_meta_section(rule_text: str):
+    """Locate the YARA-L `meta:` body. Returns (meta_label_line, body_end_line, indent)
+    as line indices into rule_text.splitlines(), or None when there is no meta: block."""
+    lines = rule_text.splitlines()
+    meta_line = None
+    for i, ln in enumerate(lines):
+        if re.match(r"\s*meta\s*:\s*$", ln):
+            meta_line = i
+            break
+    if meta_line is None:
+        return None
+    end = len(lines)
+    for j in range(meta_line + 1, len(lines)):
+        if re.match(r"\s*(events|match|outcome|condition)\s*:\s*$", lines[j]) or re.match(r"\s*}\s*$", lines[j]):
+            end = j
+            break
+    indent = None
+    for j in range(meta_line + 1, end):
+        if lines[j].strip():
+            indent = lines[j][: len(lines[j]) - len(lines[j].lstrip())]
+            break
+    if indent is None:
+        meta_indent = lines[meta_line][: len(lines[meta_line]) - len(lines[meta_line].lstrip())]
+        indent = meta_indent + "  "
+    return (meta_line, end, indent)
+
+
+@app_mcp.tool()
+def map_log_to_mitre(raw_log: str, log_type: str = "") -> str:
+    """Given a raw security log (Windows Event XML, Okta/Azure/GCP JSON, syslog, etc.),
+    infer the MITRE ATT&CK technique(s) and sub-technique(s) the logged activity maps to.
+    Every candidate ID is validated against the live MITRE ATT&CK catalog so hallucinated
+    or deprecated IDs are flagged. Returns JSON: {log_summary, log_type, attack, techniques}."""
+    raw_log = (raw_log or "").strip()
+    if not raw_log:
+        return json.dumps({"error": "raw_log is empty"})
+    index = _load_attack_index()
+    lt = (log_type or "").strip()
+    system = (
+        "You are a senior detection engineer mapping observed activity to MITRE ATT&CK "
+        "(enterprise). Be precise and conservative: only map techniques the log actually "
+        "evidences, and prefer the most specific sub-technique the evidence supports."
+    )
+    prompt = f"""A security log was captured{f' (log type: {lt})' if lt else ''}. Identify the MITRE ATT&CK techniques and sub-techniques this activity maps to.
+
+Return ONLY compact JSON:
+{{
+  "log_summary": "one sentence describing what the log shows (max 200 chars)",
+  "candidates": [
+    {{
+      "technique_id": "Txxxx (base technique, no sub)",
+      "sub_technique_id": "Txxxx.yyy or null",
+      "name": "technique or sub-technique name",
+      "tactic": "ATT&CK tactic in kebab-case, e.g. credential-access",
+      "confidence": "high|medium|low",
+      "reason": "what in the log supports this (max 200 chars, single line)"
+    }}
+  ]
+}}
+
+Rules:
+- Use real ATT&CK enterprise IDs only. If you include a sub-technique, set sub_technique_id (e.g. T1110.001) AND its parent in technique_id (T1110).
+- Only include techniques clearly evidenced by the log. Do not pad the list. Max 8 candidates.
+
+LOG:
+```
+{raw_log[:8000]}
+```
+Return ONLY valid compact JSON, no markdown."""
+    try:
+        parsed = _extract_json(_gemini(prompt, system=system, deterministic=True))
+    except Exception as e:
+        return json.dumps({"error": f"mapping failed: {e}"})
+
+    out_techs, seen = [], set()
+    for c in (parsed.get("candidates") or [])[:8]:
+        eff = (c.get("sub_technique_id") or c.get("technique_id") or "").strip().upper()
+        if not _TECHNIQUE_ID_RE.match(eff) or eff in seen:
+            continue
+        seen.add(eff)
+        canon = (index or {}).get(eff) or {}
+        validated = bool(canon) if index is not None else None
+        tactic = (canon.get("tactics") or [c.get("tactic") or ""])[0]
+        out_techs.append({
+            "id": eff,
+            "name": canon.get("full_name") or c.get("name") or "",
+            "tactic": tactic or "",
+            "is_subtechnique": canon.get("is_subtechnique", "." in eff),
+            "confidence": (c.get("confidence") or "").lower(),
+            "reason": (c.get("reason") or "")[:200],
+            "validated": validated,
+            "url": canon.get("url", ""),
+        })
+    conf_rank = {"high": 0, "medium": 1, "low": 2, "": 3}
+    out_techs.sort(key=lambda t: (t["validated"] is False, conf_rank.get(t["confidence"], 3)))
+    return json.dumps({
+        "log_summary": (parsed.get("log_summary") or "")[:200],
+        "log_type": lt,
+        "attack": {
+            "validation": "live" if index is not None else "unavailable",
+            "version": _attack_index_meta.get("version", ""),
+            "source_url": _attack_index_meta.get("source_url", ATTACK_STIX_URL),
+        },
+        "techniques": out_techs,
+    }, indent=2)
+
+
+@app_mcp.tool()
+def suggest_rule_mitre(rule_text: str, technique_ids: str) -> str:
+    """Suggest (does NOT modify or save) MITRE ATT&CK meta additions for a YARA-L rule.
+    Compares the given technique IDs against those already in the rule's meta: block and
+    returns which are present, which are missing, ready-to-paste indexed meta lines
+    (mitre_attack_technique[_N] / mitre_attack_tactic[_N]) for the missing ones, and a
+    non-persistent preview of the rule with those lines inserted. Nothing is written."""
+    rule_text = rule_text or ""
+    # normalize technique_ids (JSON array string or comma/space separated)
+    raw_ids, s = [], (technique_ids or "").strip()
+    if s.startswith("["):
+        try:
+            raw_ids = [str(x) for x in json.loads(s)]
+        except Exception:
+            raw_ids = []
+    if not raw_ids:
+        raw_ids = re.split(r"[\s,]+", s)
+    norm_ids = []
+    for x in raw_ids:
+        x = (x or "").strip().upper()
+        if _TECHNIQUE_ID_RE.match(x) and x not in norm_ids:
+            norm_ids.append(x)
+    if not norm_ids:
+        return json.dumps({"error": "no valid technique IDs provided (expected like T1110 or T1110.001)"})
+
+    index = _load_attack_index()
+    present_in_meta, max_idx = set(), 0
+    sec = _find_meta_section(rule_text)
+    meta_indent = "    "
+    if sec:
+        meta_line, end, meta_indent = sec
+        body = "\n".join(rule_text.splitlines()[meta_line + 1:end])
+        present_in_meta = {m.group(0).upper() for m in re.finditer(r"T\d{4}(?:\.\d{3})?", body)}
+        for m in re.finditer(r"mitre_attack_technique(?:_(\d+))?\s*=", body):
+            max_idx = max(max_idx, int(m.group(1)) if m.group(1) else 1)
+
+    present = [t for t in norm_ids if t in present_in_meta]
+    missing = [t for t in norm_ids if t not in present_in_meta]
+
+    suggested_lines, next_idx = [], max_idx
+    for t in missing:
+        next_idx += 1
+        suffix = "" if next_idx == 1 else f"_{next_idx}"
+        canon = index.get(t) if index else None
+        tactic = (canon.get("tactics") or [""])[0] if canon else ""
+        if tactic:
+            suggested_lines.append(f'{meta_indent}mitre_attack_tactic{suffix} = "{tactic}"')
+        suggested_lines.append(f'{meta_indent}mitre_attack_technique{suffix} = "{t}"')
+
+    preview = rule_text
+    if missing:
+        lines = rule_text.splitlines()
+        if sec:
+            meta_line, end, _ = sec
+            insert_at = end
+            while insert_at - 1 > meta_line and not lines[insert_at - 1].strip():
+                insert_at -= 1
+            preview = "\n".join(lines[:insert_at] + suggested_lines + lines[insert_at:])
+        else:
+            m = re.search(r"rule\s+\w+\s*\{", rule_text)
+            if m:
+                preview = rule_text[:m.end()] + "\n  meta:\n" + "\n".join(suggested_lines) + rule_text[m.end():]
+            else:
+                preview = rule_text + "\n# meta:\n" + "\n".join(suggested_lines)
+
+    return json.dumps({
+        "present": present,
+        "missing": missing,
+        "suggested_meta_lines": suggested_lines,
+        "preview_rule_text": preview,
+        "note": "Suggestion only. The rule was not modified or saved server-side.",
+    }, indent=2)
+
+
 @app_mcp.tool()
 def generate_synthetic_events(analysis_json: str, count: int = 5) -> str:
     """Given the output of analyze_yara_l_rule, generate synthetic UDM events that trigger
@@ -2950,6 +3255,42 @@ async def api_chat(request: Request):
     except Exception as e:
         logger.error(f"Chat error: {e}")
         return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.post("/api/map-log-mitre")
+async def api_map_log_mitre(request: Request):
+    email = _verify_google_token(request)
+    if not email:
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    body = await request.json()
+    raw_log = (body.get("raw_log", "") or "").strip()
+    log_type = (body.get("log_type", "") or "").strip()
+    if not raw_log:
+        return JSONResponse({"error": "No raw_log provided"}, status_code=400)
+    if len(raw_log) > MAX_RULE_TEXT_LEN:
+        return JSONResponse({"error": f"raw_log exceeds {MAX_RULE_TEXT_LEN} byte limit"}, status_code=400)
+    result = map_log_to_mitre(raw_log, log_type=log_type)
+    _audit("map_log_mitre", email, log_type=log_type, log_bytes=len(raw_log))
+    return JSONResponse(json.loads(result))
+
+
+@app.post("/api/suggest-rule-mitre")
+async def api_suggest_rule_mitre(request: Request):
+    email = _verify_google_token(request)
+    if not email:
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    body = await request.json()
+    rule_text = (body.get("rule", "") or "").strip()
+    technique_ids = body.get("technique_ids", "")
+    if isinstance(technique_ids, list):
+        technique_ids = json.dumps(technique_ids)
+    if not rule_text:
+        return JSONResponse({"error": "No rule provided"}, status_code=400)
+    if len(rule_text) > MAX_RULE_TEXT_LEN:
+        return JSONResponse({"error": f"Rule text exceeds {MAX_RULE_TEXT_LEN} byte limit"}, status_code=400)
+    result = suggest_rule_mitre(rule_text, str(technique_ids))
+    _audit("suggest_rule_mitre", email)
+    return JSONResponse(json.loads(result))
 
 
 # Auth-gated MCP mount -- rejects unauthenticated MCP clients
