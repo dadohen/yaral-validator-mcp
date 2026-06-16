@@ -305,6 +305,10 @@ rule detect_lateral_movement {
         Also run negative tests (false-positive check)
       </label>
       <hr class="section-divider"/>
+      <div style="font-size:0.78rem;color:var(--muted);padding:0 4px 3px">🎯 Map raw log → MITRE ATT&amp;CK</div>
+      <textarea id="raw-log-input" class="rule-textarea" style="min-height:90px" placeholder="Paste a raw log (Windows Event XML, Okta/Azure/GCP JSON, syslog...). Gemini maps it to ATT&amp;CK techniques (validated against the live catalog) and checks which are missing from the rule above."></textarea>
+      <button class="btn full" style="border-color:var(--accent2);color:var(--accent2)" onclick="mapLogMitre()">🎯 Map ATT&amp;CK from Log</button>
+      <hr class="section-divider"/>
       <div class="btn-row">
         <button class="btn" onclick="runCascadeValidation()" title="Validate a composite/chained rule end-to-end. SLOW: up to 1 hour for HOURLY rules, up to 24 hours for DAILY rules. You'll be warned with the wait estimate before the cascade runs.">🔗 Composite Validate</button>
         <button class="btn" onclick="openBatchPanel()" title="Validate many rules at once">📦 Batch</button>
@@ -827,6 +831,89 @@ async function runAnalyze() {
   } catch(e) {
     if (e.message !== 'Unauthorized') addCard('Error', e.message, 'ERROR', 'err');
   }
+}
+
+async function mapLogMitre() {
+  const log = document.getElementById('raw-log-input').value.trim();
+  if (!log) { alert('Paste a raw log first.'); return; }
+  const logType = (document.getElementById('log-type-input') ? document.getElementById('log-type-input').value : '').trim();
+  addCard('🎯 Mapping log → ATT&CK...', 'Please wait...', 'WORKING', 'info');
+  try {
+    const data = await callApi('/api/map-log-mitre', {raw_log: log, log_type: logType});
+    const cards = document.querySelectorAll('.result-card');
+    cards[cards.length - 1].remove();
+    if (data.error) { addCard('🎯 ATT&CK Mapping — Error', data.error, 'ERROR', 'err'); return; }
+    renderMitreCard(data);
+    const ids = (data.techniques || []).filter(t => t.validated !== false).map(t => t.id);
+    const rule = document.getElementById('rule-input').value.trim();
+    if (rule && ids.length) {
+      const sug = await callApi('/api/suggest-rule-mitre', {rule: rule, technique_ids: ids});
+      if (sug.error) { addCard('🧩 Coverage — Error', sug.error, 'ERROR', 'err'); }
+      else { renderMitreSuggestion(sug); }
+    } else if (ids.length && !rule) {
+      addCard('ℹ️ No rule in editor', 'Paste a YARA-L rule above, then map again to see which techniques are missing from its meta.', 'INFO', 'info');
+    }
+  } catch(e) {
+    if (e.message !== 'Unauthorized') addCard('Error', e.message, 'ERROR', 'err');
+  }
+}
+
+function renderMitreCard(data) {
+  const live = data.attack && data.attack.validation === 'live';
+  const out = [];
+  if (data.log_summary) out.push(data.log_summary + '\n');
+  (data.techniques || []).forEach(t => {
+    const mark = t.validated === true ? '✓' : (t.validated === false ? '✗ NOT IN ATT&CK' : '?');
+    out.push(`${mark}  ${t.id}  ${t.name}` + (t.tactic ? `  [${t.tactic}]` : '') + (t.confidence ? `  (${t.confidence})` : ''));
+    if (t.reason) out.push('      ' + t.reason);
+  });
+  if (!(data.techniques || []).length) out.push('No techniques identified from this log.');
+  const badge = live ? ('ATT&CK ' + (data.attack.version ? 'v' + data.attack.version : 'live')) : 'UNVALIDATED';
+  addCard('🎯 ATT&CK Techniques from Log', out.join('\n'), badge, live ? 'ok' : 'warn');
+}
+
+function renderMitreSuggestion(sug) {
+  window._mitrePreview = sug.preview_rule_text || '';
+  window._mitreLines = (sug.suggested_meta_lines || []).join('\n');
+  const present = (sug.present || []).join(', ') || '(none)';
+  const missing = (sug.missing || []).join(', ') || '(none)';
+  clearEmpty();
+  const area = document.getElementById('results-area');
+  const card = document.createElement('div');
+  card.className = 'result-card';
+  const hasMissing = (sug.missing || []).length > 0;
+  const linesBlock = hasMissing ? escHtml(window._mitreLines) : '(rule meta already covers all mapped techniques)';
+  card.innerHTML = `
+    <div class="result-card-header" onclick="toggleCard(this)">
+      <h3>🧩 Rule ATT&CK Coverage</h3>
+      <div style="display:flex;gap:8px;align-items:center">
+        <span class="badge ${hasMissing ? 'warn' : 'ok'}">${hasMissing ? sug.missing.length + ' MISSING' : 'COMPLETE'}</span>
+        <span class="collapse-toggle">▼</span>
+      </div>
+    </div>
+    <div class="result-card-body">
+      <pre>Already in meta:   ${escHtml(present)}\nMissing from meta: ${escHtml(missing)}\n\nSuggested meta lines (indexed keys):\n${linesBlock}</pre>
+      ${hasMissing ? `<div style="display:flex;gap:8px;margin-top:8px">
+        <button class="btn" onclick="copyMitreLines()">📋 Copy meta lines</button>
+        <button class="btn" onclick="insertMitrePreview()">↩ Preview into editor</button>
+      </div>
+      <div style="font-size:0.7rem;color:var(--muted);margin-top:6px">Suggestion only — nothing was saved or changed server-side. Review before you use it.</div>` : ''}
+    </div>`;
+  area.appendChild(card);
+  card.scrollIntoView({behavior:'smooth', block:'end'});
+}
+
+function copyMitreLines() {
+  if (!window._mitreLines) return;
+  navigator.clipboard.writeText(window._mitreLines)
+    .then(() => alert('Copied suggested meta lines to clipboard.'))
+    .catch(() => alert('Copy failed — select the lines in the card manually.'));
+}
+
+function insertMitrePreview() {
+  if (!window._mitrePreview) return;
+  document.getElementById('rule-input').value = window._mitrePreview;
+  alert('Editor updated with the previewed rule (local only). Review it, then Analyze or Save when ready.');
 }
 
 async function runGenerate() {
