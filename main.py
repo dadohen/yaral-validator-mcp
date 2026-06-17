@@ -653,9 +653,10 @@ def _process_mitre_candidates(parsed: dict, index: dict | None) -> list:
             "confidence": (c.get("confidence") or "").lower(),
             "reason": (c.get("reason") or "")[:200],
             "validated": validated,
-            # Only validated, non-low-confidence techniques are safe to auto-stamp;
-            # everything else is surfaced but flagged for a human decision.
-            "auto_suggest": (validated is not False) and ((c.get("confidence") or "").lower() in ("high", "medium")),
+            # Only catalog-validated, non-low-confidence techniques are safe to auto-stamp;
+            # everything else (unvalidated when the catalog is unavailable, low confidence,
+            # or not-in-catalog) is surfaced but flagged for a human decision.
+            "auto_suggest": (validated is True) and ((c.get("confidence") or "").lower() in ("high", "medium")),
             "url": canon.get("url", ""),
         })
     conf_rank = {"high": 0, "medium": 1, "low": 2, "": 3}
@@ -765,7 +766,8 @@ def suggest_rule_mitre(rule_text: str, technique_ids: str) -> str:
             elif re.match(r"\s*mitre_attack_tactic\b", ln):
                 tactic_line_idxs.append(j)
         # collect every technique ID already anywhere in the meta body
-        for mm in re.finditer(r"T\d{4}(?:\.\d{3})?", "\n".join(lines[meta_line + 1:end])):
+        # \b-anchored so a longer token (e.g. a hash or T1078901) cannot yield a phantom T1078
+        for mm in re.finditer(r"\bT\d{4}(?:\.\d{3})?\b", "\n".join(lines[meta_line + 1:end])):
             tid = mm.group(0).upper()
             if tid not in existing_ids:
                 existing_ids.append(tid)
@@ -3177,9 +3179,13 @@ async def api_verify(request: Request):
     minutes_back = min(int(body.get("minutes_back", 10)), MAX_MINUTES_BACK)
     result = verify_rule_triggered(rule_name, minutes_back=minutes_back, validation_id=validation_id)
     parsed = json.loads(result)
-    if parsed.get("triggered") is True or parsed.get("status") == "FIRED":
+    fired = (parsed.get("triggered") is True or parsed.get("status") == "FIRED"
+             or parsed.get("detection_found") is True or parsed.get("detection_count", 0) > 0)
+    if "error" in parsed:
+        metrics.record_validation(rule_name, "FAIL")
+    elif fired:
         metrics.record_validation(rule_name, "PASS")
-    elif parsed.get("status") in ("NOT_FIRED", "FAILED", "ERROR"):
+    else:
         metrics.record_validation(rule_name, "FAIL")
     return JSONResponse(parsed)
 

@@ -886,9 +886,9 @@ async function pollVerifyReal(ruleName, validationId, maxWaitS) {
     while (Date.now() < deadline) {
       await sleep(30000);
       const v = await callApi('/api/verify', {rule_name: ruleName, validation_id: validationId, minutes_back: 30});
-      if (v && v.triggered) {
+      if (v && (v.triggered || v.detection_found || v.detection_count > 0)) {
         if (progress) progress.remove();
-        addCard('✅ Real-data validation PASSED', `Rule ${ruleName} fired on your real sample (${v.detections_count || 1} detection(s)). This is high-fidelity: the data was not derived from the rule.`, 'PASS', 'ok');
+        addCard('✅ Real-data validation PASSED', `Rule ${ruleName} fired on your real sample (${v.detection_count || 1} detection(s)). This is high-fidelity: the data was not derived from the rule.`, 'PASS', 'ok');
         return;
       }
     }
