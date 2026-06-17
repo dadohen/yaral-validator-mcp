@@ -19,15 +19,18 @@ A rule can be syntactically valid, pass a linter, and still never fire because a
 
 This server adds a validation layer you can run before shipping. You paste a YARA-L rule, it extracts the exact UDM conditions required to trigger it, generates synthetic correlated events that satisfy those conditions, ingests them into your SecOps instance via UDM import (no parser delay), and confirms a detection fires. Optionally, it also generates near-miss events and proves the rule **does not** fire on them.
 
-Five validation modes:
+Validation modes:
 
 | Mode | What it proves | Speed |
 |------|----------------|-------|
-| **Positive** | Rule fires when the attack pattern is present | <5 min |
+| **Real data (highest fidelity)** | Rule fires on logs/events YOU provide (not derived from the rule). Raw logs also prove the parser maps fields the way the rule expects. | <5 min (udm) / 5+ min (parser) |
+| **Positive (synthetic)** | Rule *can* fire on a well-formed payload built from the rule. Proves logic + plumbing, not real-world telemetry. | <5 min |
 | **Negative** | Rule stays quiet on near-miss traffic (not over-broad) | <5 min |
 | **Fixture replay** | Deterministic re-run using cached events instead of regenerating | <5 min |
 | **Batch** | Pass/fail matrix across many rules in one go | <5 min per rule |
 | **Composite cascade** | Upstream rules fire → downstream composite rule fires | **up to 1h (HOURLY) or 24h (DAILY)** |
+
+**Start with Real data when you have a sample.** Synthetic positive validation generates events *from the rule itself*, so a pass proves the rule is internally consistent and the ingest path works, not that the rule matches how a real source formats events. `validate_with_real_data` (tool) / `/api/validate-real` (HTTP) ingests logs or UDM events you paste, so a pass is evidence the rule catches the real thing. Use synthetic positive validation when you have no sample data yet (for example, an empty migration tenant).
 
 Composite cascade is supported but slow — Chronicle schedules composite evaluation on HOURLY (windows 1–24h) or DAILY (windows ≥24h) cadences and rejects retrohunts on composites, so there is no fast path through Chronicle's cascade evaluator. The UI warns up-front with the expected wait (derived from the rule's match window) before ingesting the cascade, and keeps polling until the next scheduled run lands or the wait expires.
 
@@ -74,7 +77,15 @@ UDM events are ingested via `events:import` directly. Parsing is skipped entirel
 | `ingest_synthetic_events` | Imports events into SecOps via UDM (no parser) |
 | `ensure_rule_live` | Flips the rule to LIVE so detections evaluate in near-real-time |
 | `verify_rule_triggered` | Polls detections, returns plain-English summary |
-| `run_full_validation` | Orchestrates analyze → generate → ingest → verify |
+| `run_full_validation` | Orchestrates analyze → generate → ingest → verify (synthetic) |
+| `validate_with_real_data` | Validates the rule against raw logs or UDM events YOU provide (highest fidelity; raw logs run through the parser) |
+
+**MITRE ATT&CK mapping**
+| Tool | Description |
+|------|-------------|
+| `map_rule_to_mitre` | Infers the ATT&CK technique(s) a rule detects from its logic; every ID validated against the live ATT&CK catalog |
+| `map_log_to_mitre` | Infers ATT&CK technique(s) from a raw log sample (corroboration) |
+| `suggest_rule_mitre` | Suggests standard `mitre_attack_tactic`/`mitre_attack_technique` meta the SecOps ATT&CK dashboard recognizes (suggest-only, never writes) |
 
 **Negative / false-positive testing**
 | Tool | Description |
@@ -214,7 +225,10 @@ for what YARA-L constructs the validator actually covers.
 Honest scope so you don't get surprised:
 
 - **Not a rule linter.** Syntax and style are out of scope — use Google's built-in rule editor for that.
-- **Not a replacement for production telemetry.** Synthetic events prove the rule *can* fire on the pattern you described. Real data can still surface corner cases the synthetic generator didn't think of.
+- **Synthetic positive validation is self-referential.** Synthetic events are generated *from the rule*, so a synthetic pass proves the rule is internally consistent and the ingest path works — not that real telemetry triggers it. For real-world fidelity, use `validate_with_real_data` with logs/events from the actual source. Synthetic `udm_direct` also bypasses the parser, so it cannot catch a wrong field mapping; use the parser path (or real raw logs) for that.
+- **It writes test data into your LIVE tenant.** Validation ingests events and flips rules to LIVE in the real SecOps instance. Synthetic UDM events are tagged `additional.fields.yaral_validator="synthetic"` with a `yaral_validation_id`, so you can exclude validator traffic from SOAR/automation and find it via UDM search. Strongly recommended: point the validator at a dedicated test data scope / non-production tenant, and exclude tagged events from playbooks. (Raw logs ingested through the parser cannot be auto-tagged.)
+- **Negative testing is not a false-positive rate.** It checks a handful of generated near-misses, not the distribution of real benign traffic. It catches obvious over-broad patterns, not your production FP rate.
+- **ATT&CK mapping is AI-inferred.** Catalog validation guarantees a technique ID is *real*, not that the mapping is *correct*. Low-confidence and unvalidated suggestions are flagged "needs review" and never auto-applied; confirm before shipping coverage claims.
 - **Not deterministic by default.** Gemini generation varies run-to-run; use fixture caching to lock an event set for regression tests.
 - **Negative testing is bounded by imagination.** The tool generates five perturbation axes (threshold, entity, time window, action, missing event type). It won't catch every false-positive class — only the ones it knows how to perturb.
 - **Not a <5-minute composite validator.** Composite / cascade rules (those referencing `$var.detection.*` or other rules by name) *are* validated end-to-end, but slowly. Chronicle schedules composite evaluation on HOURLY cadence for match windows 1–24h and DAILY cadence for windows ≥24h, and retrohunts on composite rules don't work — so the worst-case wait is up to 1 hour (HOURLY) or up to 24 hours (DAILY). The tool tells you the expected wait up front, asks for confirmation, and then polls until the cascade fires or the wait expires. If you need faster feedback, validate each base rule here individually (that path is <5 min) and deploy the composite separately.

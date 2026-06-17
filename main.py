@@ -617,7 +617,25 @@ Return ONLY valid compact JSON, no markdown."""
         parsed = _extract_json(_gemini(prompt, system=system, deterministic=True))
     except Exception as e:
         return json.dumps({"error": f"mapping failed: {e}"})
+    return json.dumps({
+        "log_summary": (parsed.get("log_summary") or "")[:200],
+        "log_type": lt,
+        "attack": _attack_status(index),
+        "techniques": _process_mitre_candidates(parsed, index),
+    }, indent=2)
 
+
+def _attack_status(index: dict | None) -> dict:
+    return {
+        "validation": "live" if index is not None else "unavailable",
+        "version": _attack_index_meta.get("version", ""),
+        "source_url": _attack_index_meta.get("source_url", ATTACK_STIX_URL),
+    }
+
+
+def _process_mitre_candidates(parsed: dict, index: dict | None) -> list:
+    """Validate Gemini's candidate techniques against the live catalog, attach canonical
+    name/tactic, flag unknown/hallucinated IDs, and sort (validated + high confidence first)."""
     out_techs, seen = [], set()
     for c in (parsed.get("candidates") or [])[:8]:
         eff = (c.get("sub_technique_id") or c.get("technique_id") or "").strip().upper()
@@ -635,29 +653,86 @@ Return ONLY valid compact JSON, no markdown."""
             "confidence": (c.get("confidence") or "").lower(),
             "reason": (c.get("reason") or "")[:200],
             "validated": validated,
+            # Only validated, non-low-confidence techniques are safe to auto-stamp;
+            # everything else is surfaced but flagged for a human decision.
+            "auto_suggest": (validated is not False) and ((c.get("confidence") or "").lower() in ("high", "medium")),
             "url": canon.get("url", ""),
         })
     conf_rank = {"high": 0, "medium": 1, "low": 2, "": 3}
     out_techs.sort(key=lambda t: (t["validated"] is False, conf_rank.get(t["confidence"], 3)))
+    return out_techs
+
+
+@app_mcp.tool()
+def map_rule_to_mitre(rule_text: str, raw_log: str = "") -> str:
+    """Infer the MITRE ATT&CK technique(s)/sub-technique(s) a YARA-L RULE detects, reasoning
+    from the rule's logic and intent (event types, fields, conditions, name, description).
+    This is the primary mapping for tagging a rule: it reflects what the rule actually catches,
+    not just one sample log. An optional raw_log can be supplied as corroborating evidence.
+    Every ID is validated against the live MITRE ATT&CK catalog. Returns JSON:
+    {rule_summary, attack, techniques}. Each technique carries confidence + an auto_suggest
+    flag (true only when validated AND confidence is high/medium)."""
+    rule_text = (rule_text or "").strip()
+    if not rule_text:
+        return json.dumps({"error": "rule_text is empty"})
+    index = _load_attack_index()
+    corroboration = ""
+    if (raw_log or "").strip():
+        corroboration = f"\nA sample log this rule is meant to fire on (corroborating evidence only):\n```\n{raw_log.strip()[:4000]}\n```\n"
+    system = (
+        "You are a senior detection engineer mapping a detection rule to MITRE ATT&CK "
+        "(enterprise). Reason about the attacker behavior the rule DETECTS, from its event "
+        "types, field conditions, correlation logic, name, and description. Be precise and "
+        "conservative: map only techniques the rule's logic actually targets, and prefer the "
+        "most specific sub-technique the logic supports."
+    )
+    prompt = f"""Identify the MITRE ATT&CK techniques and sub-techniques this YARA-L rule detects.
+
+Return ONLY compact JSON:
+{{
+  "rule_summary": "one sentence: what attacker behavior this rule detects (max 200 chars)",
+  "candidates": [
+    {{
+      "technique_id": "Txxxx (base technique, no sub)",
+      "sub_technique_id": "Txxxx.yyy or null",
+      "name": "technique or sub-technique name",
+      "tactic": "ATT&CK tactic in kebab-case, e.g. credential-access",
+      "confidence": "high|medium|low",
+      "reason": "what in the rule logic supports this (max 200 chars, single line)"
+    }}
+  ]
+}}
+
+Rules:
+- Use real ATT&CK enterprise IDs only. If you include a sub-technique, set sub_technique_id (e.g. T1110.001) AND its parent in technique_id (T1110).
+- Map only techniques the rule's logic actually targets. Do not pad the list. Max 8 candidates.
+
+YARA-L RULE:
+```
+{rule_text[:12000]}
+```{corroboration}
+Return ONLY valid compact JSON, no markdown."""
+    try:
+        parsed = _extract_json(_gemini(prompt, system=system, deterministic=True))
+    except Exception as e:
+        return json.dumps({"error": f"mapping failed: {e}"})
     return json.dumps({
-        "log_summary": (parsed.get("log_summary") or "")[:200],
-        "log_type": lt,
-        "attack": {
-            "validation": "live" if index is not None else "unavailable",
-            "version": _attack_index_meta.get("version", ""),
-            "source_url": _attack_index_meta.get("source_url", ATTACK_STIX_URL),
-        },
-        "techniques": out_techs,
+        "rule_summary": (parsed.get("rule_summary") or "")[:200],
+        "attack": _attack_status(index),
+        "techniques": _process_mitre_candidates(parsed, index),
     }, indent=2)
 
 
 @app_mcp.tool()
 def suggest_rule_mitre(rule_text: str, technique_ids: str) -> str:
-    """Suggest (does NOT modify or save) MITRE ATT&CK meta additions for a YARA-L rule.
+    """Suggest (does NOT modify or save) MITRE ATT&CK meta for a YARA-L rule.
+
     Compares the given technique IDs against those already in the rule's meta: block and
-    returns which are present, which are missing, ready-to-paste indexed meta lines
-    (mitre_attack_technique[_N] / mitre_attack_tactic[_N]) for the missing ones, and a
-    non-persistent preview of the rule with those lines inserted. Nothing is written."""
+    returns which are present and which are missing. Emits the STANDARD meta keys that the
+    Google SecOps MITRE ATT&CK dashboard recognizes -- a single mitre_attack_technique and
+    a single mitre_attack_tactic, comma-separated when there is more than one -- carrying
+    the full recommended set (existing + newly mapped). Also returns a non-persistent
+    preview of the rule with those lines applied. Nothing is written or saved."""
     rule_text = rule_text or ""
     # normalize technique_ids (JSON array string or comma/space separated)
     raw_ids, s = [], (technique_ids or "").strip()
@@ -677,38 +752,64 @@ def suggest_rule_mitre(rule_text: str, technique_ids: str) -> str:
         return json.dumps({"error": "no valid technique IDs provided (expected like T1110 or T1110.001)"})
 
     index = _load_attack_index()
-    present_in_meta, max_idx = set(), 0
     sec = _find_meta_section(rule_text)
+    lines = rule_text.splitlines()
     meta_indent = "    "
+    existing_ids, tech_line_idxs, tactic_line_idxs = [], [], []
     if sec:
         meta_line, end, meta_indent = sec
-        body = "\n".join(rule_text.splitlines()[meta_line + 1:end])
-        present_in_meta = {m.group(0).upper() for m in re.finditer(r"T\d{4}(?:\.\d{3})?", body)}
-        for m in re.finditer(r"mitre_attack_technique(?:_(\d+))?\s*=", body):
-            max_idx = max(max_idx, int(m.group(1)) if m.group(1) else 1)
+        for j in range(meta_line + 1, end):
+            ln = lines[j]
+            if re.match(r"\s*mitre_attack_technique\b", ln):
+                tech_line_idxs.append(j)
+            elif re.match(r"\s*mitre_attack_tactic\b", ln):
+                tactic_line_idxs.append(j)
+        # collect every technique ID already anywhere in the meta body
+        for mm in re.finditer(r"T\d{4}(?:\.\d{3})?", "\n".join(lines[meta_line + 1:end])):
+            tid = mm.group(0).upper()
+            if tid not in existing_ids:
+                existing_ids.append(tid)
 
-    present = [t for t in norm_ids if t in present_in_meta]
-    missing = [t for t in norm_ids if t not in present_in_meta]
+    present = [t for t in norm_ids if t in existing_ids]
+    missing = [t for t in norm_ids if t not in existing_ids]
 
-    suggested_lines, next_idx = [], max_idx
-    for t in missing:
-        next_idx += 1
-        suffix = "" if next_idx == 1 else f"_{next_idx}"
+    # Full recommended set: existing first, then newly mapped (order-preserving dedup)
+    full_ids = list(existing_ids)
+    for t in norm_ids:
+        if t not in full_ids:
+            full_ids.append(t)
+    tactics = []
+    for t in full_ids:
         canon = index.get(t) if index else None
-        tactic = (canon.get("tactics") or [""])[0] if canon else ""
-        if tactic:
-            suggested_lines.append(f'{meta_indent}mitre_attack_tactic{suffix} = "{tactic}"')
-        suggested_lines.append(f'{meta_indent}mitre_attack_technique{suffix} = "{t}"')
+        for tac in (canon.get("tactics") if canon else []):
+            if tac and tac not in tactics:
+                tactics.append(tac)
 
+    tech_line = f'{meta_indent}mitre_attack_technique = "{", ".join(full_ids)}"'
+    tactic_line = f'{meta_indent}mitre_attack_tactic = "{", ".join(tactics)}"' if tactics else ""
+    suggested_lines = ([tactic_line] if tactic_line else []) + [tech_line]
+
+    # Preview: replace any existing mitre_attack_* lines with the canonical combined ones;
+    # otherwise insert them at the end of the meta body. Suggestion only, never persisted.
     preview = rule_text
     if missing:
-        lines = rule_text.splitlines()
         if sec:
-            meta_line, end, _ = sec
-            insert_at = end
-            while insert_at - 1 > meta_line and not lines[insert_at - 1].strip():
-                insert_at -= 1
-            preview = "\n".join(lines[:insert_at] + suggested_lines + lines[insert_at:])
+            drop = set(tech_line_idxs + tactic_line_idxs)
+            new_lines, replaced = [], False
+            for j, ln in enumerate(lines):
+                if j in drop:
+                    if not replaced:
+                        new_lines.extend(suggested_lines)
+                        replaced = True
+                    continue
+                new_lines.append(ln)
+            if not replaced:
+                meta_line, end, _ = sec
+                insert_at = end
+                while insert_at - 1 > meta_line and not lines[insert_at - 1].strip():
+                    insert_at -= 1
+                new_lines = lines[:insert_at] + suggested_lines + lines[insert_at:]
+            preview = "\n".join(new_lines)
         else:
             m = re.search(r"rule\s+\w+\s*\{", rule_text)
             if m:
@@ -719,9 +820,13 @@ def suggest_rule_mitre(rule_text: str, technique_ids: str) -> str:
     return json.dumps({
         "present": present,
         "missing": missing,
+        "all_techniques": full_ids,
         "suggested_meta_lines": suggested_lines,
         "preview_rule_text": preview,
-        "note": "Suggestion only. The rule was not modified or saved server-side.",
+        "note": ("Suggestion only -- nothing was saved. Uses the standard "
+                 "mitre_attack_tactic / mitre_attack_technique keys (comma-separated) so the "
+                 "SecOps MITRE ATT&CK dashboard recognizes them. These lines REPLACE any "
+                 "existing mitre_attack_* lines with the full recommended set."),
     }, indent=2)
 
 
@@ -1221,6 +1326,20 @@ def ingest_native_logs(logs_json: str, log_type: str) -> str:
 
 
 @app_mcp.tool()
+def _tag_validation_event(e: dict, validation_id: str) -> dict:
+    """Stamp a synthetic test event so it is identifiable and filterable in the live tenant.
+    Written to UDM additional.fields (queryable as additional.fields["yaral_validator"]) so
+    the SOC can exclude validator traffic from SOAR/automation and clean it up later.
+    Never clobbers fields the rule may match on."""
+    add = e.get("additional")
+    if not isinstance(add, dict):
+        add = {}
+    add.setdefault("yaral_validator", "synthetic")
+    add.setdefault("yaral_validation_id", validation_id)
+    e["additional"] = add
+    return e
+
+
 def ingest_synthetic_events(events_json: str) -> str:
     """Ingest synthetic UDM events directly into SecOps via events:import (no parser delay).
     Accepts the output of generate_synthetic_events ({events: [...]}).
@@ -1243,13 +1362,14 @@ def ingest_synthetic_events(events_json: str) -> str:
             if not isinstance(events, list):
                 events = [events]
 
-            sanitized = [_sanitize_udm_event(e) for e in events]
+            sanitized = [_tag_validation_event(_sanitize_udm_event(e), validation_id) for e in events]
             logger.info(f"Ingesting {len(sanitized)} UDM events via ingest_log(log_type=UDM) — first: {str(sanitized[0])[:300]}")
 
             responses = []
             for e in sanitized:
                 r = client.ingest_log(log_type="UDM", log_message=json.dumps(e))
                 responses.append(r)
+            udm_filter = f'additional.fields["yaral_validation_id"] = "{validation_id}"'
             return json.dumps({
                 "status": "ingested",
                 "validation_id": validation_id,
@@ -1257,6 +1377,12 @@ def ingest_synthetic_events(events_json: str) -> str:
                 "event_count": len(sanitized),
                 "ingestion_time": ingestion_time,
                 "api_response": responses,
+                "synthetic": True,
+                "udm_filter": udm_filter,
+                "warning": ("Synthetic test events were written to your LIVE SecOps tenant. Each is tagged "
+                            "additional.fields.yaral_validator=\"synthetic\" and "
+                            f"yaral_validation_id=\"{validation_id}\". Exclude validator traffic from SOAR/"
+                            f"automation and locate it with UDM search: {udm_filter}"),
                 "message": f"Ingested {len(sanitized)} UDM events via ingest_log(log_type=UDM). Parser skipped; rule evaluates within 30-60s for LIVE rules.",
             })
 
@@ -1644,6 +1770,125 @@ def run_full_validation(
             ),
             "results": results,
             "ingestion_time": (udm_ingest.get("ingestion_time") or parser_ingest.get("ingestion_time") or ""),
+        })
+    except Exception as e:
+        results["error"] = str(e)
+        return json.dumps({"status": "ERROR", "error": str(e), "results": results})
+
+
+@app_mcp.tool()
+def validate_with_real_data(
+    rule_text: str,
+    sample_data: str,
+    data_type: str = "raw_log",
+    log_type: str = "",
+    rule_name: str = "",
+    wait_seconds: int = 120,
+) -> str:
+    """Validate a YARA-L rule against REAL sample data you provide, instead of synthetic events
+    generated from the rule itself. This is the highest-fidelity check: because the test data is
+    NOT reverse-engineered from the rule, a pass proves the rule fires on data shaped like the
+    real world (and, with raw logs, that the parser maps fields the way the rule expects).
+
+    data_type:
+      raw_log  (default) sample_data is one or more raw log lines (paste real logs, one per
+               line, or a JSON array of strings). Ingested through Chronicle's PARSER, so this
+               also validates field mapping. Requires log_type (e.g. WINEVTLOG, OKTA).
+      udm      sample_data is real UDM event JSON: a single object, a JSON array, or
+               {"events": [...]}. Ingested directly (parser bypassed).
+
+    Use this for the truthful answer to "does my rule catch the real thing"; use
+    run_full_validation only when you have no sample data and need a quick plumbing check.
+    """
+    rule_text = (rule_text or "").strip()
+    if not rule_text:
+        return json.dumps({"status": "ERROR", "error": "rule_text is empty"})
+    dt = (data_type or "raw_log").strip().lower()
+    if dt not in ("raw_log", "udm"):
+        return json.dumps({"status": "ERROR", "error": "data_type must be 'raw_log' or 'udm'"})
+    sample = (sample_data or "").strip()
+    if not sample:
+        return json.dumps({"status": "ERROR", "error": "sample_data is empty -- paste real logs or UDM events"})
+
+    comp = _detect_composite(rule_text)
+    if comp["is_composite"]:
+        return json.dumps({
+            "status": "USE_CASCADE_VALIDATE", "is_composite": True, "heuristic": comp,
+            "message": _COMPOSITE_WARNING,
+        })
+
+    # Resolve rule name and make sure the rule is live so detections evaluate promptly.
+    if not rule_name:
+        try:
+            rule_name = json.loads(analyze_yara_l_rule(rule_text)).get("rule_name", "") or "unknown_rule"
+        except Exception:
+            rule_name = "unknown_rule"
+
+    results: dict = {"data_type": dt, "source": "user_provided_real_data"}
+    try:
+        live = json.loads(ensure_rule_live(rule_name))
+        results["enable"] = live
+
+        if dt == "udm":
+            # accept object, array, or {"events":[...]}
+            try:
+                parsed = json.loads(sample)
+            except Exception as e:
+                return json.dumps({"status": "ERROR", "error": f"sample_data is not valid UDM JSON: {e}"})
+            if isinstance(parsed, dict) and "events" in parsed:
+                events = parsed["events"]
+            elif isinstance(parsed, dict):
+                events = [parsed]
+            elif isinstance(parsed, list):
+                events = parsed
+            else:
+                return json.dumps({"status": "ERROR", "error": "UDM sample_data must be an object, array, or {events:[...]}"})
+            ingest_raw = ingest_synthetic_events(json.dumps({"events": events}))
+            ingest = json.loads(ingest_raw)
+            results["ingestion"] = ingest
+            if ingest.get("status") not in ("ingested", "ingested_fallback"):
+                return json.dumps({"status": "FAILED", "stage": "ingestion", "results": results})
+            recommended_wait = wait_seconds
+            label = "real_udm"
+        else:  # raw_log
+            if not log_type:
+                return json.dumps({"status": "ERROR", "error": "log_type is required for data_type=raw_log (e.g. WINEVTLOG, OKTA, GCP_CLOUDAUDIT)"})
+            # accept a JSON array of strings or newline-separated raw logs
+            logs = None
+            if sample.startswith("["):
+                try:
+                    arr = json.loads(sample)
+                    if isinstance(arr, list):
+                        logs = [str(x) for x in arr]
+                except Exception:
+                    logs = None
+            if logs is None:
+                logs = [ln for ln in sample.splitlines() if ln.strip()]
+            if not logs:
+                return json.dumps({"status": "ERROR", "error": "no raw log lines found in sample_data"})
+            ingest_raw = ingest_native_logs(json.dumps({"logs": logs}), log_type=log_type)
+            ingest = json.loads(ingest_raw)
+            results["ingestion"] = ingest
+            if ingest.get("status") != "ingested":
+                return json.dumps({"status": "FAILED", "stage": "ingestion", "results": results})
+            recommended_wait = max(wait_seconds, 300)  # parser latency
+            label = "real_parser_path"
+
+        return json.dumps({
+            "status": "INGESTED_AWAITING_VERIFICATION",
+            "rule_name": rule_name,
+            "fidelity": "high (validated against real sample data, not rule-derived synthetics)",
+            "verify_targets": [{
+                "label": label,
+                "validation_id": ingest.get("validation_id", ""),
+                "recommended_wait_s": recommended_wait,
+            }],
+            "validation_id": ingest.get("validation_id", ""),
+            "event_count": ingest.get("event_count", 0),
+            "next_step": ("Call verify_rule_triggered with the validation_id. raw_log/parser path "
+                          "needs 5+ minutes; udm path ~60-120s. If it does NOT fire, the rule (or a "
+                          "field mapping) does not match how this real data is actually shaped."),
+            "results": results,
         })
     except Exception as e:
         results["error"] = str(e)
@@ -3290,6 +3535,49 @@ async def api_suggest_rule_mitre(request: Request):
         return JSONResponse({"error": f"Rule text exceeds {MAX_RULE_TEXT_LEN} byte limit"}, status_code=400)
     result = suggest_rule_mitre(rule_text, str(technique_ids))
     _audit("suggest_rule_mitre", email)
+    return JSONResponse(json.loads(result))
+
+
+@app.post("/api/map-rule-mitre")
+async def api_map_rule_mitre(request: Request):
+    email = _verify_google_token(request)
+    if not email:
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    body = await request.json()
+    rule_text = (body.get("rule", "") or "").strip()
+    raw_log = (body.get("raw_log", "") or "").strip()
+    if not rule_text:
+        return JSONResponse({"error": "No rule provided"}, status_code=400)
+    if len(rule_text) > MAX_RULE_TEXT_LEN or len(raw_log) > MAX_RULE_TEXT_LEN:
+        return JSONResponse({"error": f"Input exceeds {MAX_RULE_TEXT_LEN} byte limit"}, status_code=400)
+    result = map_rule_to_mitre(rule_text, raw_log=raw_log)
+    _audit("map_rule_mitre", email, has_log=bool(raw_log))
+    return JSONResponse(json.loads(result))
+
+
+@app.post("/api/validate-real")
+async def api_validate_real(request: Request):
+    email = _verify_google_token(request)
+    if not email:
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    body = await request.json()
+    rule_text = (body.get("rule", "") or "").strip()
+    sample_data = body.get("sample_data", "") or ""
+    data_type = (body.get("data_type", "raw_log") or "raw_log").strip().lower()
+    log_type = (body.get("log_type", "") or "").strip()
+    rule_name = (body.get("rule_name", "") or "").strip()
+    wait_seconds = min(int(body.get("wait_seconds", 120) or 120), 600)
+    if not rule_text:
+        return JSONResponse({"error": "No rule provided"}, status_code=400)
+    if not sample_data.strip():
+        return JSONResponse({"error": "No sample_data provided"}, status_code=400)
+    if len(rule_text) > MAX_RULE_TEXT_LEN or len(sample_data) > MAX_RULE_TEXT_LEN:
+        return JSONResponse({"error": f"Input exceeds {MAX_RULE_TEXT_LEN} byte limit"}, status_code=400)
+    result = validate_with_real_data(
+        rule_text, sample_data, data_type=data_type, log_type=log_type,
+        rule_name=rule_name, wait_seconds=wait_seconds,
+    )
+    _audit("validate_real", email, data_type=data_type, log_type=log_type, sample_bytes=len(sample_data))
     return JSONResponse(json.loads(result))
 
 
