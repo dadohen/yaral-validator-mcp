@@ -40,7 +40,9 @@ def _gemini_url() -> str:
         f"/locations/{GEMINI_LOCATION}/publishers/google/models/{GEMINI_MODEL}:generateContent"
     )
 OAUTH_CLIENT_ID    = os.getenv("OAUTH_CLIENT_ID", "")
-ALLOWED_EMAILS     = set(e.strip() for e in os.getenv("ALLOWED_EMAILS", "").split(",") if e.strip())
+ALLOWED_EMAILS     = set(e.strip().lower() for e in os.getenv("ALLOWED_EMAILS", "").split(",") if e.strip())
+# Domain allowlist, e.g. ALLOWED_EMAIL_DOMAINS="google.com" lets any verified @google.com user in.
+ALLOWED_EMAIL_DOMAINS = set(d.strip().lower().lstrip("@") for d in os.getenv("ALLOWED_EMAIL_DOMAINS", "").split(",") if d.strip())
 PORT               = int(os.getenv("PORT", "8080"))
 
 CHRONICLE_BASE = (
@@ -212,6 +214,29 @@ def _get_adc_token() -> str:
     creds.refresh(google.auth.transport.requests.Request())
     return creds.token
 
+def _email_allowed(email: str, email_verified, hd: str = "") -> bool:
+    """Authorization decision for a verified Google identity.
+
+    - No allowlist configured -> any authenticated caller passes (unchanged behavior).
+    - Exact email in ALLOWED_EMAILS -> allowed.
+    - Domain in ALLOWED_EMAIL_DOMAINS -> allowed ONLY if the email is Google-verified
+      (so an unverified/aliased address can't claim the domain). The Workspace 'hd'
+      hosted-domain claim is honored as an equivalent, stronger signal.
+    """
+    if not (ALLOWED_EMAILS or ALLOWED_EMAIL_DOMAINS):
+        return True
+    email = (email or "").lower()
+    if email in ALLOWED_EMAILS:
+        return True
+    if ALLOWED_EMAIL_DOMAINS:
+        verified = email_verified is True or str(email_verified).lower() in ("true", "1")
+        domain = email.rsplit("@", 1)[-1] if "@" in email else ""
+        hd = (hd or "").lower()
+        if verified and (domain in ALLOWED_EMAIL_DOMAINS or hd in ALLOWED_EMAIL_DOMAINS):
+            return True
+    return False
+
+
 def _verify_google_token(request: Request) -> str | None:
     if not OAUTH_CLIENT_ID:
         logger.warning("OAUTH_CLIENT_ID not configured -- all requests rejected")
@@ -223,8 +248,8 @@ def _verify_google_token(request: Request) -> str | None:
         from google.oauth2 import id_token as gid
         from google.auth.transport import requests as gr
         info = gid.verify_oauth2_token(auth[7:], gr.Request(), OAUTH_CLIENT_ID)
-        email = info.get("email", "")
-        if ALLOWED_EMAILS and email not in ALLOWED_EMAILS:
+        email = (info.get("email", "") or "").lower()
+        if not _email_allowed(email, info.get("email_verified"), info.get("hd", "")):
             return None
         return email
     except Exception as e:
