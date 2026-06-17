@@ -305,9 +305,25 @@ rule detect_lateral_movement {
         Also run negative tests (false-positive check)
       </label>
       <hr class="section-divider"/>
-      <div style="font-size:0.78rem;color:var(--muted);padding:0 4px 3px">🎯 Map raw log → MITRE ATT&amp;CK</div>
-      <textarea id="raw-log-input" class="rule-textarea" style="min-height:90px" placeholder="Paste a raw log (Windows Event XML, Okta/Azure/GCP JSON, syslog...). Gemini maps it to ATT&amp;CK techniques (validated against the live catalog) and checks which are missing from the rule above."></textarea>
-      <button class="btn full" style="border-color:var(--accent2);color:var(--accent2)" onclick="mapLogMitre()">🎯 Map ATT&amp;CK from Log</button>
+      <div style="font-size:0.78rem;color:var(--accent2);padding:0 4px 3px">🧪 Validate with REAL data (highest fidelity)</div>
+      <div style="font-size:0.68rem;color:var(--muted);padding:0 4px 4px">Tests the rule against data you provide instead of events reverse-engineered from the rule. A pass here means the rule fires on data shaped like the real world.</div>
+      <textarea id="real-sample-input" class="rule-textarea" style="min-height:90px" placeholder="Paste REAL sample data: raw logs (one per line) or UDM event JSON. With raw logs this also proves the parser maps fields the way the rule expects."></textarea>
+      <label style="display:flex;align-items:center;gap:6px;font-size:0.72rem;color:var(--muted);padding:2px 4px">
+        <span style="flex:1">Sample type</span>
+        <select id="real-data-type" style="flex:2;background:var(--bg);color:var(--accent2);border:1px solid var(--border);border-radius:4px;padding:3px 6px;font-size:0.72rem">
+          <option value="raw_log">Raw logs (through parser — also checks field mapping)</option>
+          <option value="udm">UDM event JSON (parser bypassed)</option>
+        </select>
+      </label>
+      <div style="font-size:0.66rem;color:var(--muted);padding:0 4px 4px">Raw logs need a Log type (set it above). Uses your real data; events are tagged so you can filter validator traffic out of SOAR.</div>
+      <button class="btn primary full" onclick="validateRealData()">🧪 Validate with Real Data</button>
+      <hr class="section-divider"/>
+      <div style="font-size:0.78rem;color:var(--muted);padding:0 4px 3px">🎯 Map → MITRE ATT&amp;CK</div>
+      <textarea id="raw-log-input" class="rule-textarea" style="min-height:70px" placeholder="Optional: paste a raw log as corroborating evidence for the rule mapping, or map from a log alone."></textarea>
+      <div class="btn-row">
+        <button class="btn" style="border-color:var(--accent2);color:var(--accent2)" onclick="mapRuleMitre()" title="Map ATT&amp;CK techniques from the RULE logic (recommended). Reflects what the rule detects.">🎯 Map from Rule</button>
+        <button class="btn" onclick="mapLogMitre()" title="Map ATT&amp;CK from the pasted log alone.">📄 Map from Log</button>
+      </div>
       <hr class="section-divider"/>
       <div class="btn-row">
         <button class="btn" onclick="runCascadeValidation()" title="Validate a composite/chained rule end-to-end. SLOW: up to 1 hour for HOURLY rules, up to 24 hours for DAILY rules. You'll be warned with the wait estimate before the cascade runs.">🔗 Composite Validate</button>
@@ -833,43 +849,118 @@ async function runAnalyze() {
   }
 }
 
-async function mapLogMitre() {
-  const log = document.getElementById('raw-log-input').value.trim();
-  if (!log) { alert('Paste a raw log first.'); return; }
+async function validateRealData() {
+  const rule = document.getElementById('rule-input').value.trim();
+  if (!rule) { alert('Paste a YARA-L rule above first.'); return; }
+  const sample = document.getElementById('real-sample-input').value.trim();
+  if (!sample) { alert('Paste real sample data (raw logs or UDM JSON) first.'); return; }
+  const dataType = document.getElementById('real-data-type').value;
   const logType = (document.getElementById('log-type-input') ? document.getElementById('log-type-input').value : '').trim();
-  addCard('🎯 Mapping log → ATT&CK...', 'Please wait...', 'WORKING', 'info');
+  if (dataType === 'raw_log' && !logType) { alert('Raw logs need a Log type — set it in the "Log type" field above.'); return; }
+  addCard('🧪 Validating against real data...', 'Ingesting your sample and waiting for the rule to evaluate...', 'WORKING', 'info');
   try {
-    const data = await callApi('/api/map-log-mitre', {raw_log: log, log_type: logType});
-    const cards = document.querySelectorAll('.result-card');
-    cards[cards.length - 1].remove();
-    if (data.error) { addCard('🎯 ATT&CK Mapping — Error', data.error, 'ERROR', 'err'); return; }
-    renderMitreCard(data);
-    const ids = (data.techniques || []).filter(t => t.validated !== false).map(t => t.id);
-    const rule = document.getElementById('rule-input').value.trim();
-    if (rule && ids.length) {
-      const sug = await callApi('/api/suggest-rule-mitre', {rule: rule, technique_ids: ids});
-      if (sug.error) { addCard('🧩 Coverage — Error', sug.error, 'ERROR', 'err'); }
-      else { renderMitreSuggestion(sug); }
-    } else if (ids.length && !rule) {
-      addCard('ℹ️ No rule in editor', 'Paste a YARA-L rule above, then map again to see which techniques are missing from its meta.', 'INFO', 'info');
-    }
+    const data = await callApi('/api/validate-real', {rule: rule, sample_data: sample, data_type: dataType, log_type: logType});
+    const cards = document.querySelectorAll('.result-card'); cards[cards.length - 1].remove();
+    if (data.error) { addCard('🧪 Real-data validation — Error', data.error, 'ERROR', 'err'); return; }
+    const vt = (data.verify_targets || [])[0] || {};
+    const body = [
+      `Rule: ${data.rule_name || '(unknown)'}`,
+      `Fidelity: ${data.fidelity || ''}`,
+      `Ingested ${data.event_count || 0} real ${dataType === 'udm' ? 'UDM events' : 'log lines'} (validation_id ${data.validation_id || '?'}).`,
+      ``,
+      data.next_step || ''
+    ].join('\n');
+    addCard('🧪 Real-data validation', body, 'AWAITING VERIFY', 'info');
+    if (vt.validation_id) pollVerifyReal(data.rule_name, vt.validation_id, vt.recommended_wait_s || 120);
   } catch(e) {
     if (e.message !== 'Unauthorized') addCard('Error', e.message, 'ERROR', 'err');
   }
 }
 
-function renderMitreCard(data) {
+// Bounded auto-verify for the real-data path: poll /api/verify until the rule fires or we time out.
+async function pollVerifyReal(ruleName, validationId, maxWaitS) {
+  const deadline = Date.now() + (Math.min(maxWaitS, 600) + 90) * 1000;
+  const progress = addCard('⏳ Waiting for detection...', `Polling for rule ${ruleName} (validation_id ${validationId})...`, 'POLLING', 'info');
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  try {
+    while (Date.now() < deadline) {
+      await sleep(30000);
+      const v = await callApi('/api/verify', {rule_name: ruleName, validation_id: validationId, minutes_back: 30});
+      if (v && v.triggered) {
+        if (progress) progress.remove();
+        addCard('✅ Real-data validation PASSED', `Rule ${ruleName} fired on your real sample (${v.detections_count || 1} detection(s)). This is high-fidelity: the data was not derived from the rule.`, 'PASS', 'ok');
+        return;
+      }
+    }
+    if (progress) progress.remove();
+    addCard('❌ Real-data validation — no detection yet', `Rule ${ruleName} did not fire within the wait window. For raw logs this often means a field mapping does not match how this real data is actually shaped (the failure synthetic tests hide). Re-verify later with validation_id ${validationId}, or inspect the parsed UDM.`, 'NO FIRE', 'warn');
+  } catch(e) {
+    if (progress) progress.remove();
+    if (e.message !== 'Unauthorized') addCard('Verify error', e.message, 'ERROR', 'err');
+  }
+}
+
+async function mapRuleMitre() {
+  const rule = document.getElementById('rule-input').value.trim();
+  if (!rule) { alert('Paste a YARA-L rule first.'); return; }
+  const log = document.getElementById('raw-log-input').value.trim();
+  addCard('🎯 Mapping rule → ATT&CK...', 'Please wait...', 'WORKING', 'info');
+  try {
+    const data = await callApi('/api/map-rule-mitre', {rule: rule, raw_log: log});
+    const cards = document.querySelectorAll('.result-card'); cards[cards.length - 1].remove();
+    if (data.error) { addCard('🎯 ATT&CK Mapping — Error', data.error, 'ERROR', 'err'); return; }
+    renderMitreCard(data, 'Rule');
+    await suggestFromMapping(data, rule);
+  } catch(e) {
+    if (e.message !== 'Unauthorized') addCard('Error', e.message, 'ERROR', 'err');
+  }
+}
+
+async function mapLogMitre() {
+  const log = document.getElementById('raw-log-input').value.trim();
+  if (!log) { alert('Paste a raw log first (or use “Map from Rule”).'); return; }
+  const logType = (document.getElementById('log-type-input') ? document.getElementById('log-type-input').value : '').trim();
+  addCard('🎯 Mapping log → ATT&CK...', 'Please wait...', 'WORKING', 'info');
+  try {
+    const data = await callApi('/api/map-log-mitre', {raw_log: log, log_type: logType});
+    const cards = document.querySelectorAll('.result-card'); cards[cards.length - 1].remove();
+    if (data.error) { addCard('🎯 ATT&CK Mapping — Error', data.error, 'ERROR', 'err'); return; }
+    renderMitreCard(data, 'Log');
+    const rule = document.getElementById('rule-input').value.trim();
+    if (rule) await suggestFromMapping(data, rule);
+    else addCard('ℹ️ No rule in editor', 'Paste a YARA-L rule above to check which techniques are missing from its meta.', 'INFO', 'info');
+  } catch(e) {
+    if (e.message !== 'Unauthorized') addCard('Error', e.message, 'ERROR', 'err');
+  }
+}
+
+// Only auto-suggest validated, high/medium-confidence techniques; low/unvalidated need a human.
+async function suggestFromMapping(data, rule) {
+  const ids = (data.techniques || []).filter(t => t.auto_suggest).map(t => t.id);
+  if (!ids.length) {
+    addCard('🧩 Rule ATT&CK Coverage', 'No high-confidence, catalog-validated techniques to suggest. Review the mapped techniques above and add any you agree with manually.', 'REVIEW', 'warn');
+    return;
+  }
+  const sug = await callApi('/api/suggest-rule-mitre', {rule: rule, technique_ids: ids});
+  if (sug.error) addCard('🧩 Coverage — Error', sug.error, 'ERROR', 'err');
+  else renderMitreSuggestion(sug);
+}
+
+function renderMitreCard(data, kind) {
   const live = data.attack && data.attack.validation === 'live';
   const out = [];
-  if (data.log_summary) out.push(data.log_summary + '\n');
+  const summary = data.rule_summary || data.log_summary;
+  if (summary) out.push(summary + '\n');
   (data.techniques || []).forEach(t => {
     const mark = t.validated === true ? '✓' : (t.validated === false ? '✗ NOT IN ATT&CK' : '?');
-    out.push(`${mark}  ${t.id}  ${t.name}` + (t.tactic ? `  [${t.tactic}]` : '') + (t.confidence ? `  (${t.confidence})` : ''));
+    const flag = t.auto_suggest ? '' : '  ⚠ needs review';
+    out.push(`${mark}  ${t.id}  ${t.name}` + (t.tactic ? `  [${t.tactic}]` : '') + (t.confidence ? `  (${t.confidence})` : '') + flag);
     if (t.reason) out.push('      ' + t.reason);
   });
-  if (!(data.techniques || []).length) out.push('No techniques identified from this log.');
+  if (!(data.techniques || []).length) out.push('No techniques identified.');
+  if (!live) out.push('\n(ATT&CK catalog was unreachable — IDs are NOT validated; treat as unverified.)');
   const badge = live ? ('ATT&CK ' + (data.attack.version ? 'v' + data.attack.version : 'live')) : 'UNVALIDATED';
-  addCard('🎯 ATT&CK Techniques from Log', out.join('\n'), badge, live ? 'ok' : 'warn');
+  addCard(`🎯 ATT&CK Techniques from ${kind || 'Rule'}`, out.join('\n'), badge, live ? 'ok' : 'warn');
 }
 
 function renderMitreSuggestion(sug) {
@@ -892,12 +983,12 @@ function renderMitreSuggestion(sug) {
       </div>
     </div>
     <div class="result-card-body">
-      <pre>Already in meta:   ${escHtml(present)}\nMissing from meta: ${escHtml(missing)}\n\nSuggested meta lines (indexed keys):\n${linesBlock}</pre>
+      <pre>Already in meta:   ${escHtml(present)}\nMissing from meta: ${escHtml(missing)}\n\nRecommended meta (standard keys — REPLACE existing mitre_attack_* lines):\n${linesBlock}</pre>
       ${hasMissing ? `<div style="display:flex;gap:8px;margin-top:8px">
         <button class="btn" onclick="copyMitreLines()">📋 Copy meta lines</button>
         <button class="btn" onclick="insertMitrePreview()">↩ Preview into editor</button>
       </div>
-      <div style="font-size:0.7rem;color:var(--muted);margin-top:6px">Suggestion only — nothing was saved or changed server-side. Review before you use it.</div>` : ''}
+      <div style="font-size:0.7rem;color:var(--muted);margin-top:6px">Suggestion only — nothing was saved or changed server-side. Uses standard mitre_attack_tactic/technique keys the SecOps ATT&CK dashboard recognizes.</div>` : ''}
     </div>`;
   area.appendChild(card);
   card.scrollIntoView({behavior:'smooth', block:'end'});
